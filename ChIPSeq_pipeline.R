@@ -1,4 +1,4 @@
-setwd("/mnt/d/_R_data/projects/epigenetic_cancer/")
+setwd("/groups/stark/vloubiere/projects/insulator_tomas/")
 require(vlfunctions)
 require(readxl)
 require(data.table)
@@ -7,231 +7,129 @@ require(Rsubread)
 require(seqinr)
 require(rtracklayer)
 
-#--------------------------------------------------------------#
-# METDATA
-#--------------------------------------------------------------#
-meta <- readxl::read_xlsx("Rdata/metadata_cutnrun.xlsx")
-meta <- as.data.table(meta)[!Comment %in% c("failed", "test")]
-meta[is.na(Suffix), Suffix:= ""]
+# Metadata (select relevant tracks)
+CTCF <- fread("db/metadata/SraRunTable_CTCF_bingRen.txt")[Genotype=="Wild-type" & `Assay Type`=="ChIP-Seq"]
+Ab <- data.table(chip_antibody=c("ab992", "ab70303", "Active Motif\\,39685", "Millipore\\, 04-745", "none"),
+                 cdition= "WT",
+                 ChIP= c("Rad21", "CTCF", "H3K27Ac", "H3K4me3", "Input"))
+CTCF <- CTCF[Ab, on= "chip_antibody"]
+MAZ <- fread("db/metadata/SraRunTable_MAZ_Reinberg.txt")[Genotype=="wild type" & `Assay Type`=="ChIP-Seq" & source_name=="Embryonic stem cells"]
+Ab <- data.table(Run= c("SRR17298884", "SRR17298890", "SRR17298874"),
+                 cdition= "WT",
+                 ChIP= c("MAZ", "MAZ", "Input"))
+MAZ <- MAZ[Ab, on= "Run"]
+meta <- rbindlist(list(Ren= CTCF, Reinberg= MAZ), idcol = "lab", fill= T)
+meta <- meta[, .(Run, LibraryLayout, lab, cdition, ChIP)]
+meta[, rep:= paste0("rep", seq(.N)), .(lab, ChIP)]
+meta[, sample:= paste0(lab, "_", cdition, "_", ChIP, "_", rep)]
+# Set working directory
+meta[, cmd:= paste(c(paste("cd", getwd()),
+                     "module load build-env/2020", 
+                     "sra-toolkit/2.9.6-1-centos_linux64",
+                     "module load trim_galore/0.6.2-foss-2018b-python-3.6.6",
+                     "module load bowtie2/2.3.5.1-foss-2018b", 
+                     "module load samtools/1.9-foss-2018b",
+                     "module load macs2/2.2.5-foss-2018b-python-3.6.6"), 
+                   collapse= "; ")]
 
 #--------------------------------------------------------------#
-# Scer/Dm6 combined index
-# Yeast genome -> https://ftp.ncbi.nlm.nih.gov/genomes/all/GCF/000/146/045/GCF_000146045.2_R64/GCF_000146045.2_R64_genomic.fna
+# Download fastq files using SRR
 #--------------------------------------------------------------#
-if(length(list.files("/mnt/d/_R_data/genomes/dm6_S288C_combined_bowtie2/", ".bt2$"))==0)
-{
-  dm6 <- read.fasta("/mnt/d/_R_data/genomes/dm6/Sequence/WholeGenomeFasta/genome.fa")
-  S288C <- read.fasta("/mnt/d/_R_data/genomes/S288C/GCF_000146045.2_R64_genomic.fna")
-  cmb <- c(dm6, S288C)
-  write.fasta(sequences = cmb, 
-              names = names(cmb),
-              file.out = "/mnt/d/_R_data/genomes/dm6_S288C_combined/dm6_S288C_combined.fa")
-  system("bowtie2-build /mnt/d/_R_data/genomes/dm6_S288C_combined_bowtie2/dm6_S288C.fna /mnt/d/_R_data/genomes/dm6_S288C_combined_bowtie2/dm6_S288C")
-}
+meta[, dl_cmd:= {
+  if(length(list.files("db/fastq/", paste0(Run, ".*.fastq.gz")))==0)
+    paste0("fastq-dump -A ", 
+           Run, 
+           " --split-files --gzip -O /groups/stark/vloubiere/projects/insulator_tomas/db/fastq/")
+}, Run]
 
 #--------------------------------------------------------------#
-# Download fastq files using sra toolkit
+# Trim reads
 #--------------------------------------------------------------#
-meta[, vl_bsub(paste("module load build-env/.f2021; module load build-env/.f2021; module load sra-toolkit/3.0.0-centos_linux64;
-                     fastq-dump -A", Run, "--split-files --gzip -O /groups/stark/vloubiere/projects/insulator_tomas/db/fastq/")), Run]
-
-#--------------------------------------------------------------#
-# Retrieve fastqs and trim reads
-#--------------------------------------------------------------#
-meta[, fq1:= list.files("/mnt/f/_R_data/projects/epigenetic_cancer/db/fastq/Cut_n_run/", 
-                        recursive = T, 
-                        full.names = T, 
-                        pattern = paste0(fq1, "$")), fq1]
-meta[, fq2:= list.files("/mnt/f/_R_data/projects/epigenetic_cancer/db/fastq/Cut_n_run/", 
-                        recursive = T, 
-                        full.names = T, 
-                        pattern = paste0(fq2, "$")), fq2]
-
-meta[, fq1_trim:= gsub(".fq.gz$", "_val_1.fq.gz", fq1)]
-meta[, fq2_trim:= gsub(".fq.gz$", "_val_2.fq.gz", fq2)]
-
-mcmapply(FUN = function(outdir, fq1, fq2, fq1_trim, fq2_trim){
-  if(!file.exists(fq1_trim) && is.na(fq2_trim))
+meta[, fq1:= paste0("db/fastq/", Run, "_1.fastq.gz"), Run]
+meta[, fq2:= paste0("db/fastq/", Run, "_2.fastq.gz"), Run]
+meta[LibraryLayout=="PAIRED", fq1_trim:= gsub(".fastq.gz$", "_val_1.fq.gz", fq1)]
+meta[LibraryLayout=="PAIRED", fq2_trim:= gsub(".fastq.gz$", "_val_2.fq.gz", fq2)]
+meta[LibraryLayout=="SINGLE", fq1_trim:= gsub(".fastq.gz$", "_trimmed.fq.gz", fq1)]
+meta[, trim_cmd:= {
+  outdir <- dirname(fq1)
+  if(!file.exists(fq1_trim) && LibraryLayout=="SINGLE")
   {
-    cmd <- paste0("trim_galore --paired --gzip -o ", outdir, "/ ", fq1)
-    cmd <- paste(c("module load build-env/2020", "module load trim_galore/0.6.2-foss-2018b-python-3.6.6", cmd), collapse= ";")
-    system(cmd)
-  }
-  if((!file.exists(fq1_trim) | !file.exists(fq2_trim)) && !is.na(fq2_trim))
-  {
-    cmd <- paste0("trim_galore --paired --gzip -o ", outdir, "/ ", fq1, " ", fq2)
-    cmd <- paste(c("module load build-env/2020", "module load trim_galore/0.6.2-foss-2018b-python-3.6.6", cmd), collapse= ";")
-    system(cmd)
-  }
-  print("done")
-},
-outdir= dirname(meta$fq1),
-fq1= meta$fq1,
-fq2= meta$fq2,
-fq1_trim= meta$fq1_trim,
-fq2_trim= meta$fq2_trim,
-mc.preschedule = F,
-mc.cores = getDTthreads())
+    paste0("trim_galore --gzip -o ", outdir, "/ ", fq1)
+  }else if((!file.exists(fq1_trim) | !file.exists(fq2_trim)) && LibraryLayout=="PAIRED")
+    paste0("trim_galore --paired --gzip -o ", outdir, "/ ", fq1, " ", fq2)
+}, .(fq1, fq2, fq1_trim, fq2_trim, LibraryLayout)]
 
 #--------------------------------------------------------------#
 # Alignment
 #--------------------------------------------------------------#
-# Make chrom_sizes object
-chrom_sizes <- rbind(data.table(fread("/mnt/d/_R_data/genomes/dm6/dm6.chrom.sizes.txt", 
-                                      col.names = c("seqnames", "seqlengths")), 
-                                type="ChIP"),
-                     data.table(fread("/mnt/d/_R_data/genomes/S288C/S288C_contigs.txt"),
-                                type="spike"))
-setkeyv(chrom_sizes, "type")
-meta[, bam:= paste0("/mnt/f/_R_data/projects/epigenetic_cancer/db/bam/cutnrun/", ChIP, "_", cdition, "_", rep, Suffix, ".bam")]
-meta[, {
+meta[, bam:= paste0("db/bam/", lab, "_", cdition, "_", ChIP, "_", rep, ".bam")]
+meta[, align_cmd:= {
   if(!file.exists(bam))
   {
     # bowtie 2
     sam_file <- gsub(".bam$", ".sam", bam)
-    cmd <- paste0("bowtie2 -p 10 -x /mnt/d/_R_data/genomes/dm6_S288C_combined_bowtie2/dm6_S288C --local --very-sensitive-local --no-unal --no-mixed --no-discordant --phred33 -I 10 -X 700")
-    cmd <- paste0(cmd, " -1 ", fq1_trim)
-    cmd <- paste0(cmd, " -2 ", fq2_trim)
-    cmd <- paste0(cmd, " -S ", sam_file)
-    system(cmd)
+    aln <- "bowtie2 -p 10 -x /groups/stark/vloubiere/genomes/Mus_musculus/UCSC/mm10/Sequence/Bowtie2Index/genome --local --very-sensitive-local --no-unal --no-mixed --no-discordant --phred33 -I 10 -X 700"
+    if(LibraryLayout=="SINGLE")
+      aln <- paste0(aln, " -U ", fq1_trim) else if(LibraryLayout=="PAIRED")
+        aln <- paste0(aln, " -1 ", fq1_trim, " -2 ", fq2_trim)
+    aln <- paste0(aln, " -S ", sam_file)
     # sam to bam
-    cmd <- paste0("/usr/bin/samtools view -@ 9 -b -q 30 ", sam_file, " -o ", bam)
-    system(cmd)
-    file.remove(sam_file)
+    filter <- paste0("samtools view -@ 9 -b -q 30 ", sam_file, " -o ", bam)
+    # Remove sam file
+    clean <- paste0("rm ", sam_file)
+    cmd <- c(aln, filter, clean)
   }
-  print("DONE")
-}, bam]
+  paste(cmd, collapse= "; ")
+}, .(bam, LibraryLayout)]
 
 #--------------------------------------------------------------#
-# Peak calling
+# Peak calling separated replicates
 #--------------------------------------------------------------#
-meta[!ChIP %in% c("IgG", "input"), input:= ifelse(ChIP=="PH", "input", "IgG")]
-meta[!is.na(input), input_bam:= meta[.BY, bam, on= c("ChIP==input", "rep", "cdition")], .(input, rep, cdition)]
-MACS <- function(bam_ChIP,
-                 bam_Input,
-                 output,
-                 broad,
-                 SPMR)
-{
-  cmd <- paste0("/home/vloubiere/.local/bin/macs2 callpeak -g dm --keep-dup 1 -f BAMPE",
-                ifelse(SPMR, " -B --SPMR", ""),
-                " --outdir ", paste0(dirname(output), "/"),
-                " -t ", paste(bam_ChIP, collapse= " "), 
-                " -c ", paste(bam_Input, collapse= " "), 
-                " -n ", basename(output))
-  if(broad)
-    cmd <- paste0(cmd, " --broad")
-  return(cmd)
-}
-# Separated replicates
-meta[!is.na(input), peaks_rep:= paste0('db/peaks/cutnrun/', paste0(ChIP, "_", cdition, "_", rep))]
-meta[!is.na(input), broad:= ChIP %in% c("H3K27me3", "H2AK118Ub", "H3K4me1")]
-meta[!is.na(input), {
-  if(!file.exists(paste0(peaks_rep, "_peaks.xls")))
+meta[lab=="Ren" & ChIP!="Input", input_bam:= meta[lab=="Ren" & ChIP=="Input"][.BY, bam, on= "rep"], rep]
+meta[lab=="Ren" & ChIP!="Input" & is.na(input_bam), input_bam:= meta[lab=="Ren" & ChIP=="Input" & rep=="rep2", bam]]
+meta[lab=="Reinberg" & ChIP!="Input", input_bam:= meta[lab=="Reinberg" & ChIP=="Input" & rep=="rep1", bam]]
+meta[!is.na(input_bam), peaks_rep:= paste0("db/peaks/", sample)]
+meta[!is.na(input_bam), peakRep_cmd:= {
+  if(!file.exists(paste0(peaks_rep, "_peaks.narrowPeak")))
   {
-    cmd <- MACS(bam, 
-                input_bam, 
-                peaks_rep, 
-                broad = broad,
-                SPMR= T)
-    system(cmd)
-    print("DONE")
+    paste0("macs2 callpeak -g mm --keep-dup 1 --SPMR --outdir ", paste0(dirname(peaks_rep), "/"),
+           " --nomodel --extsize 200 ",
+           " -t ", paste(bam, collapse= " "), 
+           " -c ", paste(input_bam, collapse= " "),
+           " -n ", basename(peaks_rep))
   }
-}, .(ChIP, peaks_rep, broad)]
-# Merge
-meta[!is.na(input), peaks_merge:= paste0('db/peaks/cutnrun/', paste0(ChIP, "_", cdition, "_merge"))]
-meta[!is.na(input), {
-  if(!file.exists(paste0(peaks_merge, "_peaks.xls")))
-  {
-    cmd <- MACS(bam, 
-                input_bam, 
-                peaks_merge, 
-                broad = broad,
-                SPMR= F)
-    system(cmd)
-    print("DONE")
-  }
-}, .(ChIP, peaks_merge, broad)]
-# Return peaks file
-meta[!is.na(input), peaks_rep:= paste0(peaks_rep, ifelse(broad, "_peaks.broadPeak", "_peaks.narrowPeak"))]
-meta[!is.na(input), peaks_merge:= paste0(peaks_merge, ifelse(broad, "_peaks.broadPeak", "_peaks.narrowPeak"))]
+}, peaks_rep]
 
 #--------------------------------------------------------------#
-# Confident peaks
+# Peak calling merged replicates
 #--------------------------------------------------------------#
-meta[!is.na(input), filtered_peaks:= paste0("db/peaks/cutnrun/", ChIP, "_", cdition, 
-                                            ifelse(broad, 
-                                                   "_confident_peaks.broadPeak", 
-                                                   "_confident_peaks.narrowPeak"))]
-meta[ChIP=="H3K27me3", dist_cutoff:= 2500]
-meta[ChIP=="H2AK118Ub", dist_cutoff:= 2500]
-meta[ChIP=="H3K27Ac", dist_cutoff:= 250]
-meta[ChIP=="H3K36me3", dist_cutoff:= 250]
-meta[ChIP=="H3K4me1", dist_cutoff:= 250]
-meta[ChIP=="PH", dist_cutoff:= 250]
-meta[!is.na(input), {
-  if(!file.exists(filtered_peaks))
+meta[!is.na(input_bam), peaks_merge:= gsub("^(.*)_rep.*", "\\1_merge", peaks_rep)]
+meta[!is.na(input_bam), peakMerge_cmd:= {
+  if(!file.exists(paste0(peaks_merge, "_peaks.narrowPeak")))
   {
-    .c <- vl_importBed(peaks_merge)
-    .c <- .c[signalValue>2 & qValue>2]
-    .c <- .c[vl_covBed(.c, unique(peaks_rep[rep=="rep1"]))>0]
-    .c <- .c[vl_covBed(.c, unique(peaks_rep[rep=="rep2"]))>0]
-    .c$idx <- vl_collapseBed(.c, 
-                             mingap = dist_cutoff, 
-                             return_idx_only = T)
-    .c[, c("start", "end"):= .(min(start), max(end)), idx]
-    .c$idx <- NULL
-    .c <- .c[, .SD[which.max(qValue)], .(seqnames, start, end)]
-    fwrite(.c,
-           filtered_peaks,
-           sep= "\t",
-           quote= F,
-           na= ".",
-           col.names= F)
+    paste0("macs2 callpeak -g mm --keep-dup 1 -B --SPMR --outdir ", paste0(dirname(peaks_merge), "/"),
+           " --nomodel --extsize 200 ",
+           " -t ", paste(bam, collapse= " "),
+           " -c ", paste(input_bam, collapse= " "),
+           " -n ", basename(peaks_merge))
   }
-  print("DONE")
-}, .(filtered_peaks, peaks_merge, dist_cutoff)]
-
-#--------------------------------------------------------------#
-# Merged_peaks
-#--------------------------------------------------------------#
-meta[!is.na(input), merged_file:= paste0("db/peaks/cutnrun_merged_peaks/", ChIP, "_merged_peaks", 
-                                         ifelse(broad, ".broadPeak", ".narrowPeak"))]
-meta[!is.na(input), {
-  if(!file.exists(merged_file))
-  {
-    .c <- vl_importBed(unique(filtered_peaks))
-    .c$idx <- vl_collapseBed(.c, 
-                             mingap = dist_cutoff, 
-                             return_idx_only = T)
-    .c[, c("start", "end"):= .(min(start), max(end)), idx]
-    .c$idx <- NULL
-    .c <- .c[, .SD[which.max(qValue)], .(seqnames, start, end)]
-    fwrite(.c,
-           merged_file,
-           sep= "\t",
-           quote= F,
-           na= ".",
-           col.names= F)
-  }
-  print("DONE")
-}, .(merged_file, dist_cutoff)]
+}, peaks_merge]
+meta[, final:= paste(na.omit(unique(unlist(.SD))), collapse = "; "), .(lab, cdition, ChIP), .SDcols= patterns("cmd$")]
+# meta[, vl_bsub(final, o = "log/", cores = 8, m = 20, t= '08:00:00'), final]
 
 #--------------------------------------------------------------#
 # bw files
 #--------------------------------------------------------------#
-meta[!is.na(peaks_rep), bw_file:= paste0("db/bw/cutnrun/", ChIP, "_", cdition, "_", rep, ".bw")]
-meta[!is.na(peaks_rep), {
+meta[, bw_file:= paste0("db/bw/", lab, "_", cdition, "_", ChIP, "_merge.bw")]
+meta[!is.na(peaks_merge), {
   if(!file.exists(bw_file))
   {
-    .g <- fread(gsub(ifelse(broad, "peaks.broadPeak$", "peaks.narrowPeak$"),
-                     "treat_pileup.bdg" ,
-                     peaks_rep),
+    .g <- fread(paste0(peaks_merge, "_treat_pileup.bdg"),
                 col.names = c("seqnames", "start", "end", "score"))
     .g[, start:= start+1]
     # Format GRanges
     .g <- GRanges(.g)
-    BS <- BSgenome::getBSgenome("dm6")
+    BS <- BSgenome::getBSgenome("mm10")
     GenomeInfoDb::seqlevels(.g, pruning.mode="coarse") <- GenomeInfoDb::seqlevels(BS)
     GenomeInfoDb::seqlengths(.g) <- GenomeInfoDb::seqlengths(BS)
     # save
@@ -239,22 +137,39 @@ meta[!is.na(peaks_rep), {
                            con= bw_file)
   }
   print("done")
-}, .(peaks_rep, bw_file, broad)]
-meta[!is.na(peaks_rep), bw_merge:= paste0("db/bw/cutnrun/", ChIP, "_", cdition, "_merge.bw")]
-meta[!is.na(peaks_rep), {
-  if(!file.exists(bw_merge))
-  {
-    vl_bw_merge(bw_file, 
-                "dm6", 
-                bins_width = 25L, 
-                output = bw_merge)
-  }
-  print("done")
-}, .(peaks_rep, bw_file, broad)]
+}, .(peaks_merge, bw_file)]
 
 #--------------------------------------------------------------#
-# SAVE
+# Confident peaks
 #--------------------------------------------------------------#
-fwrite(processed,
-       "Rdata/processed_metadata_CUTNRUN.txt",
-       na= NA)
+meta[!is.na(peaks_merge), confident_peaks:= paste0(peaks_merge, "_confident.narrowPeak"), peaks_merge]
+meta[!is.na(peaks_merge), {
+  if(!file.exists(confident_peaks))
+  {
+    .c <- vl_importBed(paste0(peaks_merge, "_peaks.narrowPeak"))
+    ov <- lapply(peaks_rep, function(x) vl_covBed(.c, paste0(x, "_peaks.narrowPeak")))
+    .c <- .c[apply(as.data.table(ov), 1, function(x) all(x>0))]
+    rtracklayer::export(.c, 
+                        confident_peaks)  
+  }
+  .SD
+}, .(peaks_merge, confident_peaks)]
+
+#--------------------------------------------------------------#
+# Screenshot
+#--------------------------------------------------------------#
+tracks <- c("db/bw/Reinberg_WT_MAZ_merge.bw",
+            "db/peaks/Reinberg_WT_MAZ_merge_confident.narrowPeak",
+            "db/bw/Ren_WT_CTCF_merge.bw",
+            "db/peaks/Ren_WT_CTCF_merge_confident.narrowPeak",
+            "db/bw/Ren_WT_H3K27Ac_merge.bw",
+            "db/peaks/Ren_WT_H3K27Ac_merge_confident.narrowPeak",
+            "db/bw/Ren_WT_H3K4me3_merge.bw",
+            "db/peaks/Ren_WT_H3K4me3_merge_confident.narrowPeak",
+            "db/bw/Ren_WT_Rad21_merge.bw",
+            "db/peaks/Ren_WT_Rad21_merge_confident.narrowPeak")
+pdf("pdf/screenshot_ChIPSeq.pdf", height = 5)
+vl_screenshot(data.table(seqnames= "chr3", start= 50e6, end= 53e6),
+              tracks = tracks,
+              names= make.unique(unlist(tstrsplit(tracks, "_", keep= 3))))
+dev.off()
